@@ -125,7 +125,7 @@ $("files").addEventListener("change",e=>{
   [...e.target.files].forEach(f=>{
     const r=new FileReader();
     r.onload=()=>{ const img=new Image(); img.onload=()=>{
-      images.push({id:Math.random().toString(36).slice(2),name:f.name,dataUrl:r.result,natW:img.naturalWidth,natH:img.naturalHeight,set:"",dist:"",expected:"",detections:[],status:"ready",tokens:0,inTok:0,outTok:0,model:""});
+      images.push({id:Math.random().toString(36).slice(2),name:f.name,dataUrl:r.result,natW:img.naturalWidth,natH:img.naturalHeight,set:"",dist:"",expected:"",detections:[],status:"ready",tokens:0,inTok:0,outTok:0,model:"",tiles:[]});
       render();
     }; img.onerror=()=>{ $("status").textContent=`Couldn't load ${f.name} (RAW/DNG won't load — upload the JPEG).`; }; img.src=r.result; };
     r.readAsDataURL(f);
@@ -151,13 +151,16 @@ function render(){
         <div><button class="btn run" style="padding:7px 12px">Run</button></div>
       </div>
       <div class="res muted" style="margin-top:6px">—</div>
-      <div class="dets" style="margin-top:6px"></div>`;
+      <div class="dets" style="margin-top:6px"></div>
+      <button class="btn ghost tilesbtn" style="margin-top:8px;padding:5px 10px;font-size:12px">🔍 Show tiles</button>
+      <div class="tiles-debug" data-open="0" style="margin-top:8px"></div>`;
     $("grid").appendChild(el);
     const img=el.querySelector("img");
     el.querySelector(".setsel").addEventListener("change",e=>{im.set=e.target.value==='—'?'':e.target.value; renderSummary();});
     el.querySelector(".distsel").addEventListener("change",e=>{im.dist=e.target.value==='—'?'':e.target.value; renderSummary();});
     el.querySelector(".exp").addEventListener("input",e=>{im.expected=e.target.value; updateRes(im,el); renderSummary();});
     el.querySelector(".run").addEventListener("click",()=>runOne(im,el));
+    el.querySelector(".tilesbtn").addEventListener("click",()=>renderTiles(im,el));
     im._el=el;
     if(img.complete) setTimeout(()=>redraw(im),0); else img.onload=()=>redraw(im);
     redrawDetsList(im,el); updateRes(im,el);
@@ -234,6 +237,26 @@ function renderSummary(){
     <p class="muted" style="margin:8px 0 0;font-size:11.5px">Detected = boxes at the current confidence threshold. "No damage" should read clean; if it shows false positives, your threshold is too low. For damage sets, set Expected # to see rough recall. Compare 5 ft vs 10 ft to see where distance breaks detection.</p>`;
 }
 
+function renderTiles(im,el){
+  const box=el.querySelector(".tiles-debug"), btn=el.querySelector(".tilesbtn");
+  if(box.dataset.open==="1"){ box.innerHTML=""; box.dataset.open="0"; btn.textContent="🔍 Show tiles"; return; }
+  if(!im.tiles.length){ box.innerHTML='<span class="muted" style="font-size:12px">Run this photo first.</span>'; return; }
+  box.dataset.open="1"; btn.textContent="🔼 Hide tiles";
+  box.innerHTML='<div class="muted" style="font-size:11px;margin-bottom:6px">Each tile exactly as sent to the model, with the model\'s raw boxes. Tight here = good; loose here = the model. (overlap means a hit can appear in 2 tiles)</div>'+
+    im.tiles.map((t,i)=>`<div style="display:inline-block;margin:0 6px 8px 0;vertical-align:top;width:150px">
+      <div class="imgwrap"><img src="${t.dataUrl}" style="width:150px;display:block"><canvas></canvas></div>
+      <div class="muted" style="font-size:10px">tile ${i+1}: ${t.dets&&t.dets.length?t.dets.map(d=>`${d.type} ${Math.round((d.confidence||0)*100)}`).join(", "):"none"}</div>
+    </div>`).join("");
+  [...box.querySelectorAll(".imgwrap")].forEach((wrap,i)=>{
+    const img=wrap.querySelector("img"), cv=wrap.querySelector("canvas");
+    const draw=()=>{ const w=img.clientWidth||150,h=img.clientHeight||150; cv.width=w; cv.height=h; const ctx=cv.getContext("2d"); ctx.clearRect(0,0,w,h);
+      (im.tiles[i].dets||[]).forEach(d=>{ const bb=d.bbox||[0,0,0,0];
+        ctx.strokeStyle="#f79a32"; ctx.lineWidth=2; ctx.strokeRect(bb[0]*w,bb[1]*h,bb[2]*w,bb[3]*h);
+        ctx.fillStyle="#f79a32"; ctx.font="9px sans-serif"; ctx.fillText(`${Math.round((d.confidence||0)*100)}`,bb[0]*w+1,Math.max(8,bb[1]*h-1)); }); };
+    if(img.complete)draw(); else img.onload=draw;
+  });
+}
+
 // ---- tiling ----
 function makeTiles(im){
   const cols=+$("cols").value,rows=+$("rows").value,ov=(+$("overlap").value)/100;
@@ -248,7 +271,7 @@ function makeTiles(im){
 function cropTile(imgEl,t){
   const c=document.createElement("canvas"); c.width=t.sw; c.height=t.sh;
   c.getContext("2d").drawImage(imgEl,t.sx,t.sy,t.sw,t.sh,0,0,t.sw,t.sh);
-  return c.toDataURL("image/png").split(",")[1];
+  return c.toDataURL("image/png");
 }
 
 // ---- API ----
@@ -278,12 +301,13 @@ function parseDets(txt){
 async function runOne(im,el){
   if(!$("key").value.trim()){$("status").textContent="Enter your API key first.";return;}
   const imgEl=el.querySelector("img");
-  im.status="running"; im.detections=[]; im.tokens=0; im.inTok=0; im.outTok=0; im.err=""; im.model=$("model").value; updateRes(im,el); redraw(im);
+  im.status="running"; im.detections=[]; im.tiles=[]; im.tokens=0; im.inTok=0; im.outTok=0; im.err=""; im.model=$("model").value; updateRes(im,el); redraw(im);
   const tiles=makeTiles(im); const conc=Math.max(1,+$("conc").value); let done=0;
   const work=tiles.map(t=>async()=>{
     try{
-      const b64=cropTile(imgEl,t);
+      const dataUrl=cropTile(imgEl,t); const b64=dataUrl.split(",")[1];
       const {dets,inTok,outTok}=await callClaude(b64); im.inTok+=inTok; im.outTok+=outTok; im.tokens=im.inTok+im.outTok;
+      im.tiles.push({dataUrl,dets});
       dets.forEach(d=>{
         const bb=d.bbox||[0,0,0,0];
         const ax=t.sx+bb[0]*t.sw, ay=t.sy+bb[1]*t.sh, aw=bb[2]*t.sw, ah=bb[3]*t.sh;
