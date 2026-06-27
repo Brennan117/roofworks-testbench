@@ -26,22 +26,37 @@
   .imgwrap canvas{position:absolute;top:0;left:0;width:100%;height:100%}
   .muted{color:var(--muted)}
   .tag{display:inline-block;background:var(--panel2);border:1px solid var(--border);border-radius:5px;padding:1px 7px;font-size:11px;margin:2px 4px 2px 0}
-  .det{font-size:12px;padding:3px 0;border-bottom:1px solid var(--border)}
   .slider{width:100%}
   #status{font-size:12.5px;color:var(--muted);min-height:18px}
-  .num{width:64px}
+  .num{width:60px}
   a{color:var(--accent)}
   code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--border)}
+  th{color:var(--muted);font-weight:500}
+  .legend li{margin-bottom:2px}
 </style>
 </head>
 <body>
 <header><h1>🔨 RoofWorks — Damage Detection Test Bench <span class="muted" style="font-weight:400;font-size:12px">· local · bake-off harness</span></h1></header>
 <div class="wrap">
 
+  <div class="card legend">
+    <div style="font-weight:700;margin-bottom:6px">Test plan (from the field log)</div>
+    <ul style="margin:0 0 8px 18px;padding:0;font-size:12.5px">
+      <li><b>Reference/master</b> — 5 ft & 10 ft (1 RAW + 1 JPEG each)</li>
+      <li><b>Set 1 — No damage</b> (control → false-positive check)</li>
+      <li><b>Set 2 — Subtle (ice)</b> — "super ice" hail stand-in</li>
+      <li><b>Set 3 — Subtle rock</b> · <b>Set 4 — Heavy rock</b> · <b>Set 5 — Mashed</b></li>
+      <li>Each set shot at <b>5 ft & 10 ft</b>, RAW + JPEG</li>
+    </ul>
+    <div class="muted" style="font-size:11.5px">⚠️ Upload the <b>JPEGs</b> — RAW/DNG won't load in a browser, and the model only ingests JPEG/PNG anyway. Tag each photo by Set + Distance below to get a scored summary (recall on damage sets, false positives on the no-damage set).</div>
+  </div>
+
   <div class="card">
     <div class="row">
       <div style="flex:1;min-width:260px">
-        <label>Anthropic API key (stored locally in this browser only — never uploaded anywhere but Anthropic)</label>
+        <label>Anthropic API key (stored locally in this browser only — sent only to Anthropic)</label>
         <input type="password" id="key" placeholder="sk-ant-...">
       </div>
       <div>
@@ -57,19 +72,23 @@
       <div><label>Tiles across</label><input type="number" id="cols" class="num" value="3" min="1" max="8"></div>
       <div><label>Tiles down</label><input type="number" id="rows" class="num" value="3" min="1" max="8"></div>
       <div><label>Overlap %</label><input type="number" id="overlap" class="num" value="15" min="0" max="50"></div>
-      <div><label>Max concurrent calls</label><input type="number" id="conc" class="num" value="3" min="1" max="8"></div>
+      <div><label>Max concurrent</label><input type="number" id="conc" class="num" value="3" min="1" max="8"></div>
       <div style="flex:1;min-width:200px">
         <label>Confidence threshold: <span id="thv">0.50</span></label>
         <input type="range" id="thresh" class="slider" min="0" max="1" step="0.05" value="0.5">
       </div>
     </div>
     <div class="row" style="margin-top:12px">
-      <div><label>Add roof photos (shoot at 10–20 ft, JPEG)</label><input type="file" id="files" accept="image/*" multiple></div>
+      <div><label>Add roof photos (JPEG)</label><input type="file" id="files" accept="image/*" multiple></div>
       <div><button class="btn" id="runall">Run all ▶</button></div>
       <div><button class="btn ghost" id="clear">Clear</button></div>
     </div>
     <p id="status" style="margin:10px 0 0"></p>
-    <p class="muted" style="margin:6px 0 0;font-size:11.5px">Tip: tile size ≈ model's native input — sweep <code>tiles across/down</code> to find the sweet spot. More tiles = more detail + more cost/latency. Enter the <i>expected damage count</i> per photo (from ground truth) to compare against what the model finds.</p>
+  </div>
+
+  <div class="card" id="summaryCard" style="display:none">
+    <div style="font-weight:700;margin-bottom:8px">Summary by set <span class="muted" style="font-weight:400;font-size:11.5px">(at current threshold)</span></div>
+    <div id="summary"></div>
   </div>
 
   <div class="grid" id="grid"></div>
@@ -78,13 +97,15 @@
 <script>
 const $=id=>document.getElementById(id);
 const LS="roofbench.cfg";
+const SETS=["","Reference","No damage","Subtle (ice)","Subtle rock","Heavy rock","Mashed"];
+const SET_ORDER=SETS.slice(1);
 const PROMPT=`You are a roof-damage inspector analyzing one close-up photo (a tile of a larger asphalt-shingle roof). Identify every VISIBLE damage instance.
 Damage classes: "hail" (impact bruise/dent or granule loss exposing the mat), "creased" (creased or lifted shingle), "missing_shingle", "missing_material", "loose", "other".
 For each distinct instance output an object: {"type": <class>, "confidence": <0..1>, "bbox": [x, y, w, h] as fractions of THIS image (0..1, origin top-left), "note": <short>}.
 Do NOT flag normal wear, dirt, shadows, or color variation as damage. If there is no clear damage, output [].
 Respond with ONLY a JSON array. No prose, no markdown fences.`;
 
-let images=[]; // {id, name, dataUrl, natW, natH, expected, detections:[{type,conf,fx,fy,fw,fh,note}], status, tokens}
+let images=[]; // {id,name,dataUrl,natW,natH,set,dist,expected,detections:[],status,tokens,err,_el}
 
 function loadCfg(){ try{const c=JSON.parse(localStorage.getItem(LS)||"{}");
   if(c.key)$("key").value=c.key; if(c.model)$("model").value=c.model;
@@ -95,15 +116,15 @@ function saveCfg(){ localStorage.setItem(LS,JSON.stringify({key:$("key").value,m
 ["key","model","cols","rows","overlap","conc"].forEach(id=>$(id).addEventListener("change",saveCfg));
 loadCfg();
 
-$("thresh").addEventListener("input",()=>{ $("thv").textContent=(+$("thresh").value).toFixed(2); images.forEach(redraw); });
+$("thresh").addEventListener("input",()=>{ $("thv").textContent=(+$("thresh").value).toFixed(2); images.forEach(im=>{redraw(im);redrawDetsList(im,im._el);updateRes(im,im._el);}); renderSummary(); });
 
 $("files").addEventListener("change",e=>{
   [...e.target.files].forEach(f=>{
     const r=new FileReader();
     r.onload=()=>{ const img=new Image(); img.onload=()=>{
-      images.push({id:Math.random().toString(36).slice(2),name:f.name,dataUrl:r.result,natW:img.naturalWidth,natH:img.naturalHeight,expected:"",detections:[],status:"ready",tokens:0});
+      images.push({id:Math.random().toString(36).slice(2),name:f.name,dataUrl:r.result,natW:img.naturalWidth,natH:img.naturalHeight,set:"",dist:"",expected:"",detections:[],status:"ready",tokens:0});
       render();
-    }; img.src=r.result; };
+    }; img.onerror=()=>{ $("status").textContent=`Couldn't load ${f.name} (RAW/DNG won't load — upload the JPEG).`; }; img.src=r.result; };
     r.readAsDataURL(f);
   });
   e.target.value="";
@@ -121,20 +142,27 @@ function render(){
       </div>
       <div class="imgwrap" style="margin:8px 0"><img src="${im.dataUrl}"><canvas></canvas></div>
       <div class="row" style="gap:8px">
+        <div><label>Set</label><select class="setsel">${SETS.map(s=>`<option ${s===im.set?'selected':''}>${s||'—'}</option>`).join("")}</select></div>
+        <div><label>Dist</label><select class="distsel"><option ${im.dist===''?'selected':''}>—</option><option ${im.dist==='5 ft'?'selected':''}>5 ft</option><option ${im.dist==='10 ft'?'selected':''}>10 ft</option></select></div>
         <div><label>Expected #</label><input type="number" class="num exp" value="${im.expected}" min="0"></div>
-        <div style="flex:1"><label>Result</label><div class="res muted">—</div></div>
         <div><button class="btn run" style="padding:7px 12px">Run</button></div>
       </div>
-      <div class="dets" style="margin-top:8px"></div>`;
+      <div class="res muted" style="margin-top:6px">—</div>
+      <div class="dets" style="margin-top:6px"></div>`;
     $("grid").appendChild(el);
     const img=el.querySelector("img");
-    el.querySelector(".exp").addEventListener("input",e=>{im.expected=e.target.value; updateRes(im,el);});
+    el.querySelector(".setsel").addEventListener("change",e=>{im.set=e.target.value==='—'?'':e.target.value; renderSummary();});
+    el.querySelector(".distsel").addEventListener("change",e=>{im.dist=e.target.value==='—'?'':e.target.value; renderSummary();});
+    el.querySelector(".exp").addEventListener("input",e=>{im.expected=e.target.value; updateRes(im,el); renderSummary();});
     el.querySelector(".run").addEventListener("click",()=>runOne(im,el));
     im._el=el;
     if(img.complete) setTimeout(()=>redraw(im),0); else img.onload=()=>redraw(im);
     redrawDetsList(im,el); updateRes(im,el);
   });
+  renderSummary();
 }
+
+function detCount(im){ const th=+$("thresh").value; return im.detections.filter(d=>d.conf>=th).length; }
 
 function redraw(im){
   if(!im._el)return;
@@ -152,27 +180,53 @@ function redraw(im){
   });
 }
 function redrawDetsList(im,el){
-  const th=+$("thresh").value; const shown=im.detections.filter(d=>d.conf>=th);
+  if(!el)return; const th=+$("thresh").value; const shown=im.detections.filter(d=>d.conf>=th);
   const counts={}; shown.forEach(d=>counts[d.type]=(counts[d.type]||0)+1);
   el.querySelector(".dets").innerHTML = shown.length
     ? Object.entries(counts).map(([k,v])=>`<span class="tag">${k}: ${v}</span>`).join("")
     : `<span class="muted" style="font-size:12px">${im.status==="done"?"No damage above threshold":"—"}</span>`;
 }
 function updateRes(im,el){
-  const th=+$("thresh").value; const det=im.detections.filter(d=>d.conf>=th).length;
-  const exp=im.expected===""?null:+im.expected;
+  if(!el)return; const det=detCount(im); const exp=im.expected===""?null:+im.expected;
   let s=`detected <b>${det}</b>`; if(exp!=null) s+=` / expected ${exp}`;
   if(im.tokens) s+=` · ${im.tokens} tok`;
-  if(im.status==="running") s=`<span style="color:var(--accent)">${im.status}…</span> `+s;
+  if(im.status==="running") s=`<span style="color:var(--accent)">running…</span> `+s;
   if(im.status==="error") s=`<span style="color:var(--bad)">error</span> `+(im.err||"");
   el.querySelector(".res").innerHTML=s;
+}
+
+function renderSummary(){
+  const tagged=images.filter(im=>im.set);
+  if(!tagged.length){ $("summaryCard").style.display="none"; return; }
+  $("summaryCard").style.display="block";
+  // group by set, then split 5ft/10ft
+  const rows=[];
+  SET_ORDER.forEach(set=>{
+    const grp=tagged.filter(im=>im.set===set); if(!grp.length)return;
+    ["5 ft","10 ft",""].forEach(dist=>{
+      const g=grp.filter(im=>im.dist===dist); if(!g.length)return;
+      const photos=g.length;
+      const det=g.reduce((s,im)=>s+detCount(im),0);
+      const exp=g.reduce((s,im)=>s+(im.expected===""?0:+im.expected),0);
+      const anyExp=g.some(im=>im.expected!=="");
+      rows.push({set,dist:dist||"—",photos,det,exp,anyExp,noDamage:set==="No damage"});
+    });
+  });
+  $("summary").innerHTML=`<table><tr><th>Set</th><th>Dist</th><th>Photos</th><th>Detected</th><th>Expected</th><th>Read</th></tr>`+
+    rows.map(r=>{
+      let read,color="";
+      if(r.noDamage){ read=r.det===0?"clean ✓":`${r.det} false positive(s)`; color=r.det===0?"var(--good)":"var(--bad)"; }
+      else if(r.anyExp){ const rec=r.exp?Math.round(100*Math.min(r.det,r.exp)/r.exp):0; read=`~${rec}% found`; color=rec>=70?"var(--good)":rec>=40?"var(--accent)":"var(--bad)"; }
+      else read="—";
+      return `<tr><td>${r.set}</td><td>${r.dist}</td><td>${r.photos}</td><td>${r.det}</td><td>${r.exp||"—"}</td><td style="color:${color}">${read}</td></tr>`;
+    }).join("")+`</table>
+    <p class="muted" style="margin:8px 0 0;font-size:11.5px">Detected = boxes at the current confidence threshold. "No damage" should read clean; if it shows false positives, your threshold is too low. For damage sets, set Expected # to see rough recall. Compare 5 ft vs 10 ft to see where distance breaks detection.</p>`;
 }
 
 // ---- tiling ----
 function makeTiles(im){
   const cols=+$("cols").value,rows=+$("rows").value,ov=(+$("overlap").value)/100;
-  const tiles=[]; const tw=im.natW/cols, thh=im.natH/rows;
-  const ox=tw*ov, oy=thh*ov;
+  const tiles=[]; const tw=im.natW/cols, thh=im.natH/rows; const ox=tw*ov, oy=thh*ov;
   for(let j=0;j<rows;j++)for(let i=0;i<cols;i++){
     let sx=i*tw-ox, sy=j*thh-oy, sw=tw+2*ox, sh=thh+2*oy;
     sx=Math.max(0,sx); sy=Math.max(0,sy); sw=Math.min(im.natW-sx,sw); sh=Math.min(im.natH-sy,sh);
@@ -214,9 +268,8 @@ function parseDets(txt){
 async function runOne(im,el){
   if(!$("key").value.trim()){$("status").textContent="Enter your API key first.";return;}
   const imgEl=el.querySelector("img");
-  im.status="running"; im.detections=[]; im.tokens=0; updateRes(im,el); redraw(im);
-  const tiles=makeTiles(im); const conc=Math.max(1,+$("conc").value);
-  let done=0;
+  im.status="running"; im.detections=[]; im.tokens=0; im.err=""; updateRes(im,el); redraw(im);
+  const tiles=makeTiles(im); const conc=Math.max(1,+$("conc").value); let done=0;
   const work=tiles.map(t=>async()=>{
     try{
       const b64=cropTile(imgEl,t);
@@ -228,14 +281,13 @@ async function runOne(im,el){
           fx:ax/im.natW,fy:ay/im.natH,fw:aw/im.natW,fh:ah/im.natH,note:d.note||""});
       });
     }catch(e){ im.err=e.message; }
-    done++; $("status").textContent=`${im.name}: ${done}/${tiles.length} tiles`; redraw(im); redrawDetsList(im,el); updateRes(im,el);
+    done++; $("status").textContent=`${im.name}: ${done}/${tiles.length} tiles`; redraw(im); redrawDetsList(im,el); updateRes(im,el); renderSummary();
   });
-  // simple concurrency pool
   let idx=0;
   async function worker(){ while(idx<work.length){ const my=idx++; await work[my](); } }
   await Promise.all(Array.from({length:Math.min(conc,work.length)},worker));
   im.status=im.err?"error":"done";
-  redraw(im); redrawDetsList(im,el); updateRes(im,el);
+  redraw(im); redrawDetsList(im,el); updateRes(im,el); renderSummary();
   $("status").textContent=`${im.name}: done (${im.detections.length} raw detections, ${im.tokens} tokens)`;
 }
 
