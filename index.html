@@ -50,7 +50,7 @@
       <li><b>Set 3 — Subtle rock</b> · <b>Set 4 — Heavy rock</b> · <b>Set 5 — Mashed</b></li>
       <li>Each set shot at <b>5 ft & 10 ft</b>, RAW + JPEG</li>
     </ul>
-    <div class="muted" style="font-size:11.5px">⚠️ Upload the <b>JPEGs</b> — RAW/DNG won't load in a browser, and the model only ingests JPEG/PNG anyway. Tag each photo by Set + Distance below to get a scored summary (recall on damage sets, false positives on the no-damage set).</div>
+    <div class="muted" style="font-size:11.5px">⚠️ Upload the <b>JPEGs</b> — RAW/DNG won't load in a browser, and the model only ingests JPEG/PNG anyway. Tiles are sent as <b>lossless PNG</b> (no re-compression) — the highest quality achievable in-browser; the full RAW "max-detail" develop pipeline is desktop-only. Tag each photo by Set + Distance for a scored summary, and watch the live <b>cost</b> readout.</div>
   </div>
 
   <div class="card">
@@ -84,6 +84,7 @@
       <div><button class="btn ghost" id="clear">Clear</button></div>
     </div>
     <p id="status" style="margin:10px 0 0"></p>
+    <p id="cost" class="muted" style="margin:6px 0 0;font-size:12.5px"></p>
   </div>
 
   <div class="card" id="summaryCard" style="display:none">
@@ -99,6 +100,8 @@ const $=id=>document.getElementById(id);
 const LS="roofbench.cfg";
 const SETS=["","Reference","No damage","Subtle (ice)","Subtle rock","Heavy rock","Mashed"];
 const SET_ORDER=SETS.slice(1);
+const PRICING={"claude-opus-4-8":[5,25],"claude-sonnet-4-6":[3,15],"claude-haiku-4-5":[1,5]}; // $/1M [in,out]
+const costOf=(inT,outT,model)=>{const p=PRICING[model]||[5,25];return inT/1e6*p[0]+outT/1e6*p[1];};
 const PROMPT=`You are a roof-damage inspector analyzing one close-up photo (a tile of a larger asphalt-shingle roof). Identify every VISIBLE damage instance.
 Damage classes: "hail" (impact bruise/dent or granule loss exposing the mat), "creased" (creased or lifted shingle), "missing_shingle", "missing_material", "loose", "other".
 For each distinct instance output an object: {"type": <class>, "confidence": <0..1>, "bbox": [x, y, w, h] as fractions of THIS image (0..1, origin top-left), "note": <short>}.
@@ -122,7 +125,7 @@ $("files").addEventListener("change",e=>{
   [...e.target.files].forEach(f=>{
     const r=new FileReader();
     r.onload=()=>{ const img=new Image(); img.onload=()=>{
-      images.push({id:Math.random().toString(36).slice(2),name:f.name,dataUrl:r.result,natW:img.naturalWidth,natH:img.naturalHeight,set:"",dist:"",expected:"",detections:[],status:"ready",tokens:0});
+      images.push({id:Math.random().toString(36).slice(2),name:f.name,dataUrl:r.result,natW:img.naturalWidth,natH:img.naturalHeight,set:"",dist:"",expected:"",detections:[],status:"ready",tokens:0,inTok:0,outTok:0,model:""});
       render();
     }; img.onerror=()=>{ $("status").textContent=`Couldn't load ${f.name} (RAW/DNG won't load — upload the JPEG).`; }; img.src=r.result; };
     r.readAsDataURL(f);
@@ -159,10 +162,18 @@ function render(){
     if(img.complete) setTimeout(()=>redraw(im),0); else img.onload=()=>redraw(im);
     redrawDetsList(im,el); updateRes(im,el);
   });
-  renderSummary();
+  renderSummary(); renderCost();
 }
 
 function detCount(im){ const th=+$("thresh").value; return im.detections.filter(d=>d.conf>=th).length; }
+
+function renderCost(){
+  const run=images.filter(im=>im.tokens>0);
+  if(!run.length){ $("cost").textContent=""; return; }
+  const inT=run.reduce((s,im)=>s+im.inTok,0), outT=run.reduce((s,im)=>s+im.outTok,0);
+  const tot=run.reduce((s,im)=>s+costOf(im.inTok,im.outTok,im.model),0);
+  $("cost").innerHTML=`💸 Run cost so far: <b>~$${tot.toFixed(2)}</b> · ${run.length} photo(s) · ${inT.toLocaleString()} in + ${outT.toLocaleString()} out tokens`;
+}
 
 function redraw(im){
   if(!im._el)return;
@@ -189,7 +200,7 @@ function redrawDetsList(im,el){
 function updateRes(im,el){
   if(!el)return; const det=detCount(im); const exp=im.expected===""?null:+im.expected;
   let s=`detected <b>${det}</b>`; if(exp!=null) s+=` / expected ${exp}`;
-  if(im.tokens) s+=` · ${im.tokens} tok`;
+  if(im.tokens) s+=` · ${im.tokens} tok · ~$${costOf(im.inTok,im.outTok,im.model||$("model").value).toFixed(3)}`;
   if(im.status==="running") s=`<span style="color:var(--accent)">running…</span> `+s;
   if(im.status==="error") s=`<span style="color:var(--bad)">error</span> `+(im.err||"");
   el.querySelector(".res").innerHTML=s;
@@ -237,7 +248,7 @@ function makeTiles(im){
 function cropTile(imgEl,t){
   const c=document.createElement("canvas"); c.width=t.sw; c.height=t.sh;
   c.getContext("2d").drawImage(imgEl,t.sx,t.sy,t.sw,t.sh,0,0,t.sw,t.sh);
-  return c.toDataURL("image/jpeg",0.92).split(",")[1];
+  return c.toDataURL("image/png").split(",")[1];
 }
 
 // ---- API ----
@@ -248,14 +259,13 @@ async function callClaude(b64){
       "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
     body:JSON.stringify({model:$("model").value,max_tokens:1500,
       messages:[{role:"user",content:[
-        {type:"image",source:{type:"base64",media_type:"image/jpeg",data:b64}},
+        {type:"image",source:{type:"base64",media_type:"image/png",data:b64}},
         {type:"text",text:PROMPT}]}]})
   });
   if(!res.ok){ const e=await res.text(); throw new Error(`HTTP ${res.status}: ${e.slice(0,200)}`); }
   const j=await res.json();
   const txt=(j.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
-  const tok=(j.usage?.input_tokens||0)+(j.usage?.output_tokens||0);
-  return {dets:parseDets(txt),tok};
+  return {dets:parseDets(txt),inTok:(j.usage?.input_tokens||0),outTok:(j.usage?.output_tokens||0)};
 }
 function parseDets(txt){
   let s=txt.trim().replace(/^```(json)?/i,"").replace(/```$/,"").trim();
@@ -268,12 +278,12 @@ function parseDets(txt){
 async function runOne(im,el){
   if(!$("key").value.trim()){$("status").textContent="Enter your API key first.";return;}
   const imgEl=el.querySelector("img");
-  im.status="running"; im.detections=[]; im.tokens=0; im.err=""; updateRes(im,el); redraw(im);
+  im.status="running"; im.detections=[]; im.tokens=0; im.inTok=0; im.outTok=0; im.err=""; im.model=$("model").value; updateRes(im,el); redraw(im);
   const tiles=makeTiles(im); const conc=Math.max(1,+$("conc").value); let done=0;
   const work=tiles.map(t=>async()=>{
     try{
       const b64=cropTile(imgEl,t);
-      const {dets,tok}=await callClaude(b64); im.tokens+=tok;
+      const {dets,inTok,outTok}=await callClaude(b64); im.inTok+=inTok; im.outTok+=outTok; im.tokens=im.inTok+im.outTok;
       dets.forEach(d=>{
         const bb=d.bbox||[0,0,0,0];
         const ax=t.sx+bb[0]*t.sw, ay=t.sy+bb[1]*t.sh, aw=bb[2]*t.sw, ah=bb[3]*t.sh;
@@ -281,13 +291,13 @@ async function runOne(im,el){
           fx:ax/im.natW,fy:ay/im.natH,fw:aw/im.natW,fh:ah/im.natH,note:d.note||""});
       });
     }catch(e){ im.err=e.message; }
-    done++; $("status").textContent=`${im.name}: ${done}/${tiles.length} tiles`; redraw(im); redrawDetsList(im,el); updateRes(im,el); renderSummary();
+    done++; $("status").textContent=`${im.name}: ${done}/${tiles.length} tiles`; redraw(im); redrawDetsList(im,el); updateRes(im,el); renderSummary(); renderCost();
   });
   let idx=0;
   async function worker(){ while(idx<work.length){ const my=idx++; await work[my](); } }
   await Promise.all(Array.from({length:Math.min(conc,work.length)},worker));
   im.status=im.err?"error":"done";
-  redraw(im); redrawDetsList(im,el); updateRes(im,el); renderSummary();
+  redraw(im); redrawDetsList(im,el); updateRes(im,el); renderSummary(); renderCost();
   $("status").textContent=`${im.name}: done (${im.detections.length} raw detections, ${im.tokens} tokens)`;
 }
 
