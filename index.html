@@ -104,8 +104,9 @@ const PRICING={"claude-opus-4-8":[5,25],"claude-sonnet-4-6":[3,15],"claude-haiku
 const costOf=(inT,outT,model)=>{const p=PRICING[model]||[5,25];return inT/1e6*p[0]+outT/1e6*p[1];};
 const PROMPT=`You are a roof-damage inspector analyzing one close-up photo (a tile of a larger asphalt-shingle roof). Identify every VISIBLE damage instance.
 Damage classes: "hail" (impact bruise/dent or granule loss exposing the mat), "creased" (creased or lifted shingle), "missing_shingle", "missing_material", "loose", "other".
-For each distinct instance output an object: {"type": <class>, "confidence": <0..1>, "bbox": [x, y, w, h] as fractions of THIS image (0..1, origin top-left), "note": <short>}.
-Do NOT flag normal wear, dirt, shadows, or color variation as damage. If there is no clear damage, output [].
+IMPORTANT: water droplets, wet spots, puddles, and reflections are NOT hail and NOT damage. If you see them, still report them but use type "water" (never "hail"). Dirt/debris or normal wear you choose to flag should use type "other", not a damage class.
+For each instance output: {"type": <class or "water">, "confidence": <0..1>, "bbox": [x, y, w, h] as fractions of THIS image (0..1, origin top-left), "note": <short>}.
+If there is nothing notable at all, output [].
 Respond with ONLY a JSON array. No prose, no markdown fences.`;
 
 let images=[]; // {id,name,dataUrl,natW,natH,set,dist,expected,detections:[],status,tokens,err,_el}
@@ -153,7 +154,9 @@ function render(){
       <div class="res muted" style="margin-top:6px">—</div>
       <div class="dets" style="margin-top:6px"></div>
       <button class="btn ghost tilesbtn" style="margin-top:8px;padding:5px 10px;font-size:12px">🔍 Show tiles</button>
-      <div class="tiles-debug" data-open="0" style="margin-top:8px"></div>`;
+      <button class="btn ghost closeupbtn" style="margin:8px 0 0 6px;padding:5px 10px;font-size:12px">📸 Close-ups</button>
+      <div class="tiles-debug" data-open="0" style="margin-top:8px"></div>
+      <div class="closeups" data-open="0" style="margin-top:8px"></div>`;
     $("grid").appendChild(el);
     const img=el.querySelector("img");
     el.querySelector(".setsel").addEventListener("change",e=>{im.set=e.target.value==='—'?'':e.target.value; renderSummary();});
@@ -161,6 +164,7 @@ function render(){
     el.querySelector(".exp").addEventListener("input",e=>{im.expected=e.target.value; updateRes(im,el); renderSummary();});
     el.querySelector(".run").addEventListener("click",()=>runOne(im,el));
     el.querySelector(".tilesbtn").addEventListener("click",()=>renderTiles(im,el));
+    el.querySelector(".closeupbtn").addEventListener("click",()=>renderCloseups(im,el));
     im._el=el;
     if(img.complete) setTimeout(()=>redraw(im),0); else img.onload=()=>redraw(im);
     redrawDetsList(im,el); updateRes(im,el);
@@ -168,7 +172,7 @@ function render(){
   renderSummary(); renderCost();
 }
 
-function detCount(im){ const th=+$("thresh").value; return im.detections.filter(d=>d.conf>=th).length; }
+function detCount(im){ const th=+$("thresh").value; return im.detections.filter(d=>d.conf>=th && d.type!=="water").length; }
 
 function renderCost(){
   const run=images.filter(im=>im.tokens>0);
@@ -184,7 +188,7 @@ function redraw(im){
   const w=img.clientWidth, h=img.clientHeight; if(!w)return;
   cv.width=w; cv.height=h; const ctx=cv.getContext("2d"); ctx.clearRect(0,0,w,h);
   const th=+$("thresh").value;
-  const colors={hail:"#f79a32",creased:"#36c0e0",missing_shingle:"#dc3958",missing_material:"#dc3958",loose:"#e0b020",other:"#9aa3b2"};
+  const colors={hail:"#f79a32",creased:"#36c0e0",missing_shingle:"#dc3958",missing_material:"#dc3958",loose:"#e0b020",water:"#4f8cff",other:"#9aa3b2"};
   im.detections.filter(d=>d.conf>=th).forEach(d=>{
     const x=d.fx*w,y=d.fy*h,bw=d.fw*w,bh=d.fh*h; const c=colors[d.type]||"#fff";
     ctx.strokeStyle=c; ctx.lineWidth=2; ctx.strokeRect(x,y,bw,bh);
@@ -254,6 +258,34 @@ function renderTiles(im,el){
         ctx.strokeStyle="#f79a32"; ctx.lineWidth=2; ctx.strokeRect(bb[0]*w,bb[1]*h,bb[2]*w,bb[3]*h);
         ctx.fillStyle="#f79a32"; ctx.font="9px sans-serif"; ctx.fillText(`${Math.round((d.confidence||0)*100)}`,bb[0]*w+1,Math.max(8,bb[1]*h-1)); }); };
     if(img.complete)draw(); else img.onload=draw;
+  });
+}
+
+function renderCloseups(im,el){
+  const box=el.querySelector(".closeups"), btn=el.querySelector(".closeupbtn");
+  if(box.dataset.open==="1"){ box.innerHTML=""; box.dataset.open="0"; btn.textContent="📸 Close-ups"; return; }
+  const th=+$("thresh").value; const dets=im.detections.filter(d=>d.conf>=th);
+  if(!dets.length){ box.innerHTML='<span class="muted" style="font-size:12px">No detections above threshold — run the photo or lower the slider.</span>'; box.dataset.open="0"; return; }
+  box.dataset.open="1"; btn.textContent="🔼 Hide close-ups";
+  const imgEl=el.querySelector("img");
+  box.innerHTML='<div class="muted" style="font-size:11px;margin-bottom:6px">Auto-cropped from the SINGLE original photo (Loveland-style). If these stay sharp, one 10–15 ft JPEG is enough — no separate close-up flight needed.</div>';
+  const grid=document.createElement("div"); box.appendChild(grid);
+  const colors={hail:"#f79a32",creased:"#36c0e0",missing_shingle:"#dc3958",missing_material:"#dc3958",loose:"#e0b020",water:"#4f8cff",other:"#9aa3b2"};
+  dets.forEach(d=>{
+    const pad=0.5, disp=160;
+    let sw=d.fw*(1+2*pad)*im.natW, sh=d.fh*(1+2*pad)*im.natH;
+    let sx=(d.fx-d.fw*pad)*im.natW, sy=(d.fy-d.fh*pad)*im.natH;
+    const minPx=Math.max(im.natW,im.natH)*0.06;
+    if(sw<minPx){ sx-=(minPx-sw)/2; sw=minPx; }
+    if(sh<minPx){ sy-=(minPx-sh)/2; sh=minPx; }
+    sx=Math.max(0,Math.min(sx,im.natW-2)); sy=Math.max(0,Math.min(sy,im.natH-2));
+    sw=Math.max(2,Math.min(sw,im.natW-sx)); sh=Math.max(2,Math.min(sh,im.natH-sy));
+    const c=document.createElement("canvas"); c.width=disp; c.height=Math.max(1,Math.round(disp*sh/sw));
+    c.getContext("2d").drawImage(imgEl,sx,sy,sw,sh,0,0,c.width,c.height);
+    c.style.cssText="border:2px solid "+(colors[d.type]||"#fff")+";border-radius:6px;display:block;width:"+disp+"px";
+    const wrap=document.createElement("div"); wrap.style.cssText="display:inline-block;margin:0 6px 8px 0;vertical-align:top";
+    const cap=document.createElement("div"); cap.className="muted"; cap.style.cssText="font-size:10px;width:"+disp+"px"; cap.textContent=`${d.type} ${Math.round(d.conf*100)}%`+(d.note?` · ${d.note}`:"");
+    wrap.appendChild(c); wrap.appendChild(cap); grid.appendChild(wrap);
   });
 }
 
