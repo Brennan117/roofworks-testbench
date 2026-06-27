@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RoofWorks — Damage Detection Test Bench</title>
+<style>
+  :root{--bg:#14110b;--panel:#1f1a10;--panel2:#2a2214;--border:#43331f;--text:#e8dcc6;--muted:#a8956f;--accent:#f79a32;--good:#7e9b4e;--bad:#dc3958;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
+  header{padding:14px 20px;background:var(--panel);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}
+  h1{font-size:17px;margin:0}
+  .wrap{max-width:1100px;margin:0 auto;padding:20px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px}
+  label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+  input,select{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:7px;padding:7px 9px;font-size:13px;font-family:inherit}
+  input[type=text],input[type=password]{width:100%}
+  .row{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end}
+  .row>div{flex:0 0 auto}
+  .btn{background:var(--accent);color:#14110b;border:0;border-radius:8px;padding:9px 16px;font-weight:700;cursor:pointer;font-size:13px}
+  .btn:disabled{opacity:.5;cursor:default}
+  .btn.ghost{background:transparent;color:var(--text);border:1px solid var(--border);font-weight:500}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+  .imgwrap{position:relative;line-height:0;border-radius:8px;overflow:hidden;border:1px solid var(--border)}
+  .imgwrap img{width:100%;display:block}
+  .imgwrap canvas{position:absolute;top:0;left:0;width:100%;height:100%}
+  .muted{color:var(--muted)}
+  .tag{display:inline-block;background:var(--panel2);border:1px solid var(--border);border-radius:5px;padding:1px 7px;font-size:11px;margin:2px 4px 2px 0}
+  .det{font-size:12px;padding:3px 0;border-bottom:1px solid var(--border)}
+  .slider{width:100%}
+  #status{font-size:12.5px;color:var(--muted);min-height:18px}
+  .num{width:64px}
+  a{color:var(--accent)}
+  code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<header><h1>🔨 RoofWorks — Damage Detection Test Bench <span class="muted" style="font-weight:400;font-size:12px">· local · bake-off harness</span></h1></header>
+<div class="wrap">
+
+  <div class="card">
+    <div class="row">
+      <div style="flex:1;min-width:260px">
+        <label>Anthropic API key (stored locally in this browser only — never uploaded anywhere but Anthropic)</label>
+        <input type="password" id="key" placeholder="sk-ant-...">
+      </div>
+      <div>
+        <label>Model</label>
+        <select id="model">
+          <option value="claude-opus-4-8">Claude Opus 4.8 (best)</option>
+          <option value="claude-sonnet-4-6">Claude Sonnet 4.6 (cheaper)</option>
+          <option value="claude-haiku-4-5">Claude Haiku 4.5 (cheapest)</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div><label>Tiles across</label><input type="number" id="cols" class="num" value="3" min="1" max="8"></div>
+      <div><label>Tiles down</label><input type="number" id="rows" class="num" value="3" min="1" max="8"></div>
+      <div><label>Overlap %</label><input type="number" id="overlap" class="num" value="15" min="0" max="50"></div>
+      <div><label>Max concurrent calls</label><input type="number" id="conc" class="num" value="3" min="1" max="8"></div>
+      <div style="flex:1;min-width:200px">
+        <label>Confidence threshold: <span id="thv">0.50</span></label>
+        <input type="range" id="thresh" class="slider" min="0" max="1" step="0.05" value="0.5">
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div><label>Add roof photos (shoot at 10–20 ft, JPEG)</label><input type="file" id="files" accept="image/*" multiple></div>
+      <div><button class="btn" id="runall">Run all ▶</button></div>
+      <div><button class="btn ghost" id="clear">Clear</button></div>
+    </div>
+    <p id="status" style="margin:10px 0 0"></p>
+    <p class="muted" style="margin:6px 0 0;font-size:11.5px">Tip: tile size ≈ model's native input — sweep <code>tiles across/down</code> to find the sweet spot. More tiles = more detail + more cost/latency. Enter the <i>expected damage count</i> per photo (from ground truth) to compare against what the model finds.</p>
+  </div>
+
+  <div class="grid" id="grid"></div>
+
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const LS="roofbench.cfg";
+const PROMPT=`You are a roof-damage inspector analyzing one close-up photo (a tile of a larger asphalt-shingle roof). Identify every VISIBLE damage instance.
+Damage classes: "hail" (impact bruise/dent or granule loss exposing the mat), "creased" (creased or lifted shingle), "missing_shingle", "missing_material", "loose", "other".
+For each distinct instance output an object: {"type": <class>, "confidence": <0..1>, "bbox": [x, y, w, h] as fractions of THIS image (0..1, origin top-left), "note": <short>}.
+Do NOT flag normal wear, dirt, shadows, or color variation as damage. If there is no clear damage, output [].
+Respond with ONLY a JSON array. No prose, no markdown fences.`;
+
+let images=[]; // {id, name, dataUrl, natW, natH, expected, detections:[{type,conf,fx,fy,fw,fh,note}], status, tokens}
+
+function loadCfg(){ try{const c=JSON.parse(localStorage.getItem(LS)||"{}");
+  if(c.key)$("key").value=c.key; if(c.model)$("model").value=c.model;
+  if(c.cols)$("cols").value=c.cols; if(c.rows)$("rows").value=c.rows;
+  if(c.overlap!=null)$("overlap").value=c.overlap; if(c.conc)$("conc").value=c.conc;
+}catch{} }
+function saveCfg(){ localStorage.setItem(LS,JSON.stringify({key:$("key").value,model:$("model").value,cols:$("cols").value,rows:$("rows").value,overlap:$("overlap").value,conc:$("conc").value})); }
+["key","model","cols","rows","overlap","conc"].forEach(id=>$(id).addEventListener("change",saveCfg));
+loadCfg();
+
+$("thresh").addEventListener("input",()=>{ $("thv").textContent=(+$("thresh").value).toFixed(2); images.forEach(redraw); });
+
+$("files").addEventListener("change",e=>{
+  [...e.target.files].forEach(f=>{
+    const r=new FileReader();
+    r.onload=()=>{ const img=new Image(); img.onload=()=>{
+      images.push({id:Math.random().toString(36).slice(2),name:f.name,dataUrl:r.result,natW:img.naturalWidth,natH:img.naturalHeight,expected:"",detections:[],status:"ready",tokens:0});
+      render();
+    }; img.src=r.result; };
+    r.readAsDataURL(f);
+  });
+  e.target.value="";
+});
+$("clear").addEventListener("click",()=>{images=[];render();});
+
+function render(){
+  $("grid").innerHTML="";
+  images.forEach(im=>{
+    const el=document.createElement("div"); el.className="card"; el.style.marginBottom="0";
+    el.innerHTML=`
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+        <b style="font-size:13px;word-break:break-all">${im.name}</b>
+        <span class="muted" style="font-size:11px">${im.natW}×${im.natH}</span>
+      </div>
+      <div class="imgwrap" style="margin:8px 0"><img src="${im.dataUrl}"><canvas></canvas></div>
+      <div class="row" style="gap:8px">
+        <div><label>Expected #</label><input type="number" class="num exp" value="${im.expected}" min="0"></div>
+        <div style="flex:1"><label>Result</label><div class="res muted">—</div></div>
+        <div><button class="btn run" style="padding:7px 12px">Run</button></div>
+      </div>
+      <div class="dets" style="margin-top:8px"></div>`;
+    $("grid").appendChild(el);
+    const img=el.querySelector("img");
+    el.querySelector(".exp").addEventListener("input",e=>{im.expected=e.target.value; updateRes(im,el);});
+    el.querySelector(".run").addEventListener("click",()=>runOne(im,el));
+    im._el=el;
+    if(img.complete) setTimeout(()=>redraw(im),0); else img.onload=()=>redraw(im);
+    redrawDetsList(im,el); updateRes(im,el);
+  });
+}
+
+function redraw(im){
+  if(!im._el)return;
+  const img=im._el.querySelector("img"), cv=im._el.querySelector("canvas");
+  const w=img.clientWidth, h=img.clientHeight; if(!w)return;
+  cv.width=w; cv.height=h; const ctx=cv.getContext("2d"); ctx.clearRect(0,0,w,h);
+  const th=+$("thresh").value;
+  const colors={hail:"#f79a32",creased:"#36c0e0",missing_shingle:"#dc3958",missing_material:"#dc3958",loose:"#e0b020",other:"#9aa3b2"};
+  im.detections.filter(d=>d.conf>=th).forEach(d=>{
+    const x=d.fx*w,y=d.fy*h,bw=d.fw*w,bh=d.fh*h; const c=colors[d.type]||"#fff";
+    ctx.strokeStyle=c; ctx.lineWidth=2; ctx.strokeRect(x,y,bw,bh);
+    ctx.fillStyle=c; ctx.font="11px sans-serif"; const t=`${d.type} ${(d.conf*100|0)}`;
+    const tw=ctx.measureText(t).width+6; ctx.fillRect(x,Math.max(0,y-14),tw,14);
+    ctx.fillStyle="#14110b"; ctx.fillText(t,x+3,Math.max(10,y-3));
+  });
+}
+function redrawDetsList(im,el){
+  const th=+$("thresh").value; const shown=im.detections.filter(d=>d.conf>=th);
+  const counts={}; shown.forEach(d=>counts[d.type]=(counts[d.type]||0)+1);
+  el.querySelector(".dets").innerHTML = shown.length
+    ? Object.entries(counts).map(([k,v])=>`<span class="tag">${k}: ${v}</span>`).join("")
+    : `<span class="muted" style="font-size:12px">${im.status==="done"?"No damage above threshold":"—"}</span>`;
+}
+function updateRes(im,el){
+  const th=+$("thresh").value; const det=im.detections.filter(d=>d.conf>=th).length;
+  const exp=im.expected===""?null:+im.expected;
+  let s=`detected <b>${det}</b>`; if(exp!=null) s+=` / expected ${exp}`;
+  if(im.tokens) s+=` · ${im.tokens} tok`;
+  if(im.status==="running") s=`<span style="color:var(--accent)">${im.status}…</span> `+s;
+  if(im.status==="error") s=`<span style="color:var(--bad)">error</span> `+(im.err||"");
+  el.querySelector(".res").innerHTML=s;
+}
+
+// ---- tiling ----
+function makeTiles(im){
+  const cols=+$("cols").value,rows=+$("rows").value,ov=(+$("overlap").value)/100;
+  const tiles=[]; const tw=im.natW/cols, thh=im.natH/rows;
+  const ox=tw*ov, oy=thh*ov;
+  for(let j=0;j<rows;j++)for(let i=0;i<cols;i++){
+    let sx=i*tw-ox, sy=j*thh-oy, sw=tw+2*ox, sh=thh+2*oy;
+    sx=Math.max(0,sx); sy=Math.max(0,sy); sw=Math.min(im.natW-sx,sw); sh=Math.min(im.natH-sy,sh);
+    tiles.push({sx,sy,sw,sh});
+  }
+  return tiles;
+}
+function cropTile(imgEl,t){
+  const c=document.createElement("canvas"); c.width=t.sw; c.height=t.sh;
+  c.getContext("2d").drawImage(imgEl,t.sx,t.sy,t.sw,t.sh,0,0,t.sw,t.sh);
+  return c.toDataURL("image/jpeg",0.92).split(",")[1];
+}
+
+// ---- API ----
+async function callClaude(b64){
+  const res=await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{"content-type":"application/json","x-api-key":$("key").value.trim(),
+      "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
+    body:JSON.stringify({model:$("model").value,max_tokens:1500,
+      messages:[{role:"user",content:[
+        {type:"image",source:{type:"base64",media_type:"image/jpeg",data:b64}},
+        {type:"text",text:PROMPT}]}]})
+  });
+  if(!res.ok){ const e=await res.text(); throw new Error(`HTTP ${res.status}: ${e.slice(0,200)}`); }
+  const j=await res.json();
+  const txt=(j.content||[]).filter(b=>b.type==="text").map(b=>b.text).join("");
+  const tok=(j.usage?.input_tokens||0)+(j.usage?.output_tokens||0);
+  return {dets:parseDets(txt),tok};
+}
+function parseDets(txt){
+  let s=txt.trim().replace(/^```(json)?/i,"").replace(/```$/,"").trim();
+  try{const a=JSON.parse(s); return Array.isArray(a)?a:[];}catch{}
+  const i=s.indexOf("["),k=s.lastIndexOf("]");
+  if(i>=0&&k>i){ try{const a=JSON.parse(s.slice(i,k+1)); return Array.isArray(a)?a:[];}catch{} }
+  return [];
+}
+
+async function runOne(im,el){
+  if(!$("key").value.trim()){$("status").textContent="Enter your API key first.";return;}
+  const imgEl=el.querySelector("img");
+  im.status="running"; im.detections=[]; im.tokens=0; updateRes(im,el); redraw(im);
+  const tiles=makeTiles(im); const conc=Math.max(1,+$("conc").value);
+  let done=0;
+  const work=tiles.map(t=>async()=>{
+    try{
+      const b64=cropTile(imgEl,t);
+      const {dets,tok}=await callClaude(b64); im.tokens+=tok;
+      dets.forEach(d=>{
+        const bb=d.bbox||[0,0,0,0];
+        const ax=t.sx+bb[0]*t.sw, ay=t.sy+bb[1]*t.sh, aw=bb[2]*t.sw, ah=bb[3]*t.sh;
+        im.detections.push({type:(d.type||"other"),conf:(typeof d.confidence==="number"?d.confidence:0.5),
+          fx:ax/im.natW,fy:ay/im.natH,fw:aw/im.natW,fh:ah/im.natH,note:d.note||""});
+      });
+    }catch(e){ im.err=e.message; }
+    done++; $("status").textContent=`${im.name}: ${done}/${tiles.length} tiles`; redraw(im); redrawDetsList(im,el); updateRes(im,el);
+  });
+  // simple concurrency pool
+  let idx=0;
+  async function worker(){ while(idx<work.length){ const my=idx++; await work[my](); } }
+  await Promise.all(Array.from({length:Math.min(conc,work.length)},worker));
+  im.status=im.err?"error":"done";
+  redraw(im); redrawDetsList(im,el); updateRes(im,el);
+  $("status").textContent=`${im.name}: done (${im.detections.length} raw detections, ${im.tokens} tokens)`;
+}
+
+$("runall").addEventListener("click",async()=>{
+  if(!images.length){$("status").textContent="Add some photos first.";return;}
+  $("runall").disabled=true;
+  for(const im of images){ await runOne(im,im._el); }
+  $("runall").disabled=false;
+});
+</script>
+</body>
+</html>
